@@ -238,6 +238,35 @@ if __name__ == "__main__":
     df_w21 = df_w21.rename(columns={old: new for old, new in rename_map.items() if old in df_w21.columns})
     df_w22 = df_w22.rename(columns={old: new for old, new in rename_map.items() if old in df_w22.columns})
 
+    # --- функция: разделить Name -> Name + Surname ---
+    def add_surname(df: pd.DataFrame) -> pd.DataFrame:
+        if "Name" not in df.columns:
+            return df
+
+        def split_name(full):
+            if not isinstance(full, str) or not full.strip():
+                return "", ""
+            parts = full.strip().split(" ", 1)
+            if len(parts) == 1:
+                return parts[0], ""
+            return parts[0], parts[1]
+
+        first_list, last_list = zip(*df["Name"].map(split_name))
+        df = df.copy()
+        df["Name"] = list(first_list)
+        df["Surname"] = list(last_list)
+
+        # поставить Surname сразу после Name
+        cols = df.columns.tolist()
+        cols.remove("Surname")
+        cols.insert(cols.index("Name") + 1, "Surname")
+        df = df[cols]
+        return df
+
+    # применяем к обоим неделям
+    df_w21 = add_surname(df_w21)
+    df_w22 = add_surname(df_w22)
+
     print("1st week rows:", len(df_w21))
     print("2nd week rows:", len(df_w22))
 
