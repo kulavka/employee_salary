@@ -5,10 +5,11 @@ from pathlib import Path
 import pandas as pd
 import pdfplumber
 
-PDF_PATH = r"C:\Users\nikit\Downloads\w21 inv 28_04_2025_25_05_2025_subcontractor_followup_2025001863 copy (1).pdf"
-OUT_XLSX = "tyontekijat_table_all_strings.xlsx"
+PDF_PATH = r"C:\Users\nikit\Downloads\w22 inv 06_05_2025_01_06_2025_subcontractor_followup_2025001952 copy.pdf"
+OUT_XLSX = "tyontekijat_dynamic_any_columns.xlsx"
 
-COLS = ["Name", "Aika", "Norm", "50%", "100%", "Iltalisä", "Yövuoro", "Kaikki yhteensä"]
+REQ_FIRST = ["Työntekijät", "Aika", "Norm"]          # обязательные в начале
+REQ_LAST  = ["Kaikki yhteensä"]                      # обязательная последняя
 
 def strip_accents(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
@@ -17,159 +18,222 @@ def low_noacc(s: str) -> str:
     return strip_accents(s).lower()
 
 def rm_parens(s: str) -> str:
-    # убрать полностью участки в скобках вместе со скобками
     return re.sub(r"\([^)]*\)", "", s).strip()
 
 def join_words(words):
-    # words: список слов с полями {'text','x0','x1','top','bottom'}
     return " ".join(w["text"] for w in words)
 
 def cluster_lines(words, y_tol=3):
-    """Группируем слова в строки по Y с допуском."""
     lines = []
     for w in sorted(words, key=lambda x: x["top"]):
         if not lines:
             lines.append([w]); continue
-        last_line = lines[-1]
-        if abs(w["top"] - last_line[-1]["top"]) <= y_tol:
-            last_line.append(w)
+        last = lines[-1]
+        if abs(w["top"] - last[-1]["top"]) <= y_tol:
+            last.append(w)
         else:
             lines.append([w])
-    # внутри строки отсортируем по X
     for ln in lines:
         ln.sort(key=lambda x: x["x0"])
     return lines
 
-def find_header_line(lines):
-    """Ищем индекс строки-шапки: содержит все ключи шапки."""
-    required = ["tyontekijat", "aika", "norm", "yovuoro", "kaikki", "yhteensa"]
-    for idx, ln in enumerate(lines):
-        t = low_noacc(join_words(ln))
-        if all(k in t for k in required):
-            return idx
-    return None
+def is_header_line(line_words):
+    t = low_noacc(join_words(line_words))
+    # минимум: Työntekijät, Aika, Norm, Kaikki, Yhteensä
+    need = ["tyontekijat", "aika", "norm", "kaikki", "yhteensa"]
+    return all(k in t for k in need)
 
-def header_column_xs(header_words):
+def normalize_header(line_words):
     """
-    Возвращаем x-координаты начала колонок по словам шапки.
-    Для 'Kaikki yhteensä' берём x по слову 'Kaikki'.
+    Возвращаем список (label, x0) в порядке X для всех столбцов из шапки,
+    где 'Kaikki yhteensä' склеиваем как одно имя.
+    Остальные названия берём как есть (сырые), чтобы поддерживать любые новые колонки.
     """
-    labels_map = {
-        "tyontekijat": "Name",
-        "aika": "Aika",
-        "norm": "Norm",
-        "50%": "50%",
-        "100%": "100%",
-        "iltalisa": "Iltalisä",
-        "yovuoro": "Yövuoro",
-        "kaikki": "Kaikki yhteensä",  # берём x по 'Kaikki'
-    }
+    items = []
+    i = 0
+    while i < len(line_words):
+        w = line_words[i]
+        txt = w["text"].strip()
+        t = low_noacc(txt)
 
-    xs = {}
-    for w in header_words:
-        txt_raw = w["text"]
-        txt = low_noacc(txt_raw)
-        txt = txt.replace("ö", "o").replace("ä", "a")  # на всякий
-        if txt in labels_map:
-            xs[labels_map[txt]] = w["x0"]
-        # случаи типа "Iltalisä" -> "iltalisa", "Yövuoro" -> "yovuoro"
-        elif "iltalisa".startswith(txt):
-            xs["Iltalisä"] = xs.get("Iltalisä", w["x0"])
-        elif "yovuoro".startswith(txt):
-            xs["Yövuoro"] = xs.get("Yövuoro", w["x0"])
-        elif txt.endswith("%") and txt in ("50%", "100%"):
-            xs[txt] = w["x0"]
+        # склейка "Kaikki yhteensä"
+        if t.startswith("kaikki"):
+            label = "Kaikki yhteensä"
+            x0 = w["x0"]
+            # если следующее слово похоже на yhteensä — пропустим его
+            if i + 1 < len(line_words):
+                t2 = low_noacc(line_words[i+1]["text"].strip())
+                if "yhteensa" in t2 or "yhteensä" in strip_accents(t2):
+                    i += 1
+            items.append((label, x0))
+            i += 1
+            continue
 
-    # ожидаемый порядок колонок
-    order = ["Name", "Aika", "Norm", "50%", "100%", "Iltalisä", "Yövuoro", "Kaikki yhteensä"]
-    # если что-то не нашли, попробуем дооценить позициями ближайших слов
-    missing = [c for c in order if c not in xs]
-    if missing:
-        # возьмём ровно столько первых слов, сколько колонок, по возрастанию x0
-        sorted_by_x = sorted(header_words, key=lambda x: x["x0"])
-        approx = [w["x0"] for w in sorted_by_x[:len(order)]]
-        xs = {col: approx[i] for i, col in enumerate(order)}
-    return [xs[c] for c in order]
+        # иначе — берём текст как есть (это и есть динамическая колонка)
+        items.append((txt, w["x0"]))
+        i += 1
 
-def build_bins(col_xs):
-    """По x-координатам колонок строим границы ячеек (полубисы)."""
-    xs_sorted = sorted(col_xs)
-    # середины между соседями
+    # Удалим явный мусор из шапки (редко встречается)
+    # и поправим дубликаты названий (добавим индекс)
+    seen = {}
+    normed = []
+    for label, x in items:
+        label = label.strip()
+        if not label:
+            continue
+        # стандартизируем несколько часто встречающихся вариантов
+        if low_noacc(label) in ("tyontekijat",):
+            label = "Työntekijät"
+        elif low_noacc(label) in ("aika",):
+            label = "Aika"
+        elif low_noacc(label).startswith("norm"):
+            label = "Norm"
+        # дубликаты -> Label (2)
+        key = (label.lower(),)
+        if key in seen:
+            seen[key] += 1
+            label = f"{label} ({seen[key]})"
+        else:
+            seen[key] = 1
+        normed.append((label, x))
+
+    # Отсортируем по X
+    normed.sort(key=lambda kv: kv[1])
+
+    # Проверим наличие обязательных
+    labels_only = [l for l,_ in normed]
+    if not all(req in labels_only for req in REQ_FIRST + REQ_LAST):
+        return []  # не годится как шапка
+
+    # Убедимся, что "Kaikki yhteensä" — последняя
+    # Если нет — переместим её в конец (редкий OCR-казус)
+    if normed and normed[-1][0] != "Kaikki yhteensä":
+        # найдём её и перенесём в хвост
+        for j,(lab,xx) in enumerate(normed):
+            if lab == "Kaikki yhteensä":
+                kept = (lab, xx)
+                del normed[j]
+                normed.append(kept)
+                break
+
+    return normed
+
+def build_bins(x_list):
+    xs_sorted = list(x_list)
     mids = [(xs_sorted[i] + xs_sorted[i+1]) / 2 for i in range(len(xs_sorted)-1)]
-    # биновые границы: (-inf, mid1], (mid1, mid2], ..., (last_mid, +inf)
     return [-float("inf")] + mids + [float("inf")]
 
-def put_words_into_cells(line_words, col_labels, col_bins):
-    """
-    Разбрасываем слова строки по колонкам согласно x-координате центра слова.
-    Склеиваем тексты внутри ячейки через пробел.
-    """
-    cells = {c: [] for c in col_labels}
+def assign_cells(line_words, columns, bins):
+    cells = {c: [] for c in columns}
     for w in line_words:
         cx = (w["x0"] + w["x1"]) / 2
-        # найдём индекс бина
         bi = None
-        for i in range(len(col_bins)-1):
-            if col_bins[i] <= cx <= col_bins[i+1]:
+        for i in range(len(bins)-1):
+            if bins[i] <= cx <= bins[i+1]:
                 bi = i; break
         if bi is None:
             continue
-        col = col_labels[bi]
-        cells[col].append(w["text"])
-    # склеим
-    return {c: " ".join(v).strip() for c, v in cells.items()}
+        cells[columns[bi]].append(w["text"])
+    # склеим и очистим скобки
+    return {c: rm_parens(" ".join(v)).strip() for c, v in cells.items()}
 
 def is_total_line(line_words):
     t = low_noacc(join_words(line_words))
-    return "kaikki yhteensa" in t  # строка-итог — не включаем в таблицу
+    return ("kaikki yhteensa" in t) and ("tyontekijat" not in t)
 
-def parse_pdf_to_df(pdf_path: str) -> pd.DataFrame:
-    rows = []
+def parse_pdf_any_columns(pdf_path: str) -> pd.DataFrame:
+    all_rows = []
+    dynamic_order_global = []  # чтобы сохранить "живой" порядок появления опциональных колонок
     with pdfplumber.open(pdf_path) as pdf:
         for page_idx, page in enumerate(pdf.pages, start=1):
-            words = page.extract_words(
-                x_tolerance=2,
-                y_tolerance=2,
-                keep_blank_chars=False,
-                use_text_flow=True
-            )
+            words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False, use_text_flow=True)
             if not words:
                 continue
             lines = cluster_lines(words, y_tol=3)
+            # все шапки на странице
+            headers = [i for i, ln in enumerate(lines) if is_header_line(ln)]
+            if not headers:
+                continue
 
-            hdr_i = find_header_line(lines)
-            if hdr_i is None:
-                continue  # на странице нет нужной таблицы
-
-            header_words = lines[hdr_i]
-            col_labels = ["Name", "Aika", "Norm", "50%", "100%", "Iltalisä", "Yövuoro", "Kaikki yhteensä"]
-            col_xs = header_column_xs(header_words)
-            col_bins = build_bins(col_xs)
-
-            # строки под шапкой до итога или до конца страницы/следующей шапки
-            for ln in lines[hdr_i+1:]:
-                if is_total_line(ln):
-                    break
-                # если встретили новую шапку (редко), прерываем
-                if find_header_line([ln]) is not None:
-                    break
-
-                cells = put_words_into_cells(ln, col_labels, col_bins)
-                # если строка явно пустая/шум — пропустим
-                if not cells["Name"] and not cells["Aika"]:
+            for hi in headers:
+                header_items = normalize_header(lines[hi])
+                if not header_items:
                     continue
 
-                # убираем скобки целиком в каждой ячейке
-                cleaned = {k: rm_parens(v) for k, v in cells.items()}
-                rows.append(cleaned)
+                cols = [lab for lab,_ in header_items]
+                xs   = [x   for _,x in header_items]
 
-    return pd.DataFrame(rows, columns=COLS)
+                # bins по X
+                bins = build_bins(xs)
 
-if __name__ == "__main__":
-    df = parse_pdf_to_df(PDF_PATH)
+                # накопим глобальный порядок опциональных колонок
+                for lab in cols:
+                    if lab in REQ_FIRST or lab in REQ_LAST:
+                        continue
+                    if lab not in dynamic_order_global:
+                        dynamic_order_global.append(lab)
 
+                # строки под шапкой до итога/следующей шапки/конца
+                stop_at = len(lines)
+                for hj in headers:
+                    if hj > hi:
+                        stop_at = min(stop_at, hj)
+                for li in range(hi+1, stop_at):
+                    ln = lines[li]
+                    if is_total_line(ln):
+                        break
+                    cells = assign_cells(ln, cols, bins)
+                    # фильтруем Tekijä:
+                    if any("tekijä:" in low_noacc(v) for v in cells.values() if v):
+                        continue
+                    # отбрасываем совсем пустые
+                    if not cells.get("Työntekijät") and not cells.get("Aika"):
+                        continue
+                    all_rows.append(cells)
+
+    # Соберём полный список колонок по факту:
+    # начало: REQ_FIRST, затем dynamic_order_global (как встретились), затем REQ_LAST
+    # если некоторые из REQ_FIRST вдруг не встретились (что против ТЗ) — просто добавим их в заголовок.
+    all_cols = []
+    for c in REQ_FIRST:
+        if c not in all_cols: all_cols.append(c)
+    for c in dynamic_order_global:
+        if c not in all_cols and c not in REQ_LAST and c not in REQ_FIRST:
+            all_cols.append(c)
+    for c in REQ_LAST:
+        if c not in all_cols: all_cols.append(c)
+
+    # Создадим DataFrame, заполнив отсутствующие колонки пустыми строками
+    df = pd.DataFrame(all_rows)
+    for c in all_cols:
+        if c not in df.columns:
+            df[c] = ""
+    # Сужаем и упорядочиваем колонки под all_cols
+    df = df[all_cols]
+
+    # Финальная фильтрация Tekijä: на всякий случай
     mask = df.apply(lambda r: not any("tekijä:" in str(v).lower() for v in r.values), axis=1)
     df = df[mask].reset_index(drop=True)
+    return df
+
+if __name__ == "__main__":
+    df = parse_pdf_any_columns(PDF_PATH)
+
+    # Удаляем строки Tekijä: (подстраховка)
+    mask = df.apply(lambda r: not any("tekijä:" in str(v).lower() for v in r.values), axis=1)
+    df = df[mask].reset_index(drop=True)
+
+    # ---------- ПЕРЕИМЕНОВАНИЕ КОЛОНОК ----------
+    rename_map = {
+        "Työntekijät": "Name",
+        "Aika": "Dates",
+        "Iltalisä": "Evening shift bonus",
+        "Yövuoro": "Night shift bonus",
+        "Kaikki yhteensä": "Salary",
+    }
+
+    # Только те столбцы, которые реально существуют
+    df = df.rename(columns={old: new for old, new in rename_map.items() if old in df.columns})
 
     print("Rows:", len(df))
     df.to_excel(OUT_XLSX, index=False)
